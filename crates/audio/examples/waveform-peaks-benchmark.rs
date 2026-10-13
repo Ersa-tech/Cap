@@ -1,6 +1,10 @@
 use cap_audio::{waveform_peaks, waveform_peaks_from_slices};
 use std::time::Instant;
 
+const SLICE: usize = 32_768 * 2;
+const POOL: usize = 256;
+const SEED: u32 = 0x1234_5678;
+
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     v[v.len() / 2]
@@ -18,13 +22,9 @@ fn time<R>(runs: usize, mut f: impl FnMut() -> R) -> (f64, R) {
     (median(times), out.unwrap())
 }
 
-fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "both".into());
-    let runs = 7;
-    const SLICE: usize = 32_768 * 2;
-    const POOL: usize = 256;
-    let mut state = 0x1234_5678_u32;
-    let pool: Vec<Vec<f32>> = (0..POOL)
+fn fill_pool() -> Vec<Vec<f32>> {
+    let mut state = SEED;
+    (0..POOL)
         .map(|b| {
             (0..SLICE)
                 .map(|i| {
@@ -36,24 +36,63 @@ fn main() {
                 })
                 .collect()
         })
-        .collect();
-    let track = |minutes: usize, offset: usize| -> Vec<&[f32]> {
-        let total = minutes * 60 * 48_000 * 2;
-        let n = total.div_ceil(SLICE);
-        (0..n)
-            .map(|i| {
-                let s = pool[(i + offset) % POOL].as_slice();
-                if i == n - 1 {
-                    &s[..total - i * SLICE]
-                } else {
-                    s
-                }
-            })
-            .collect()
-    };
+        .collect()
+}
+
+fn track_slices(pool: &[Vec<f32>], minutes: usize, offset: usize) -> Vec<&[f32]> {
+    let total = minutes * 60 * 48_000 * 2;
+    let n = total.div_ceil(SLICE);
+    (0..n)
+        .map(|i| {
+            let s = pool[(i + offset) % POOL].as_slice();
+            if i == n - 1 {
+                &s[..total - i * SLICE]
+            } else {
+                s
+            }
+        })
+        .collect()
+}
+
+fn bench_four_tracks(label: &str, tracks: &[Vec<&[f32]>], runs: usize) {
+    let (old_seq, _) = time(runs, || {
+        tracks
+            .iter()
+            .map(|track| waveform_peaks(track.iter().flat_map(|slice| slice.iter()), 2))
+            .collect::<Vec<_>>()
+    });
+    let (new_seq, _) = time(runs, || {
+        tracks
+            .iter()
+            .map(|track| waveform_peaks_from_slices(track, 2, 48_000))
+            .collect::<Vec<_>>()
+    });
+    let (new_par, _) = time(runs, || {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = tracks
+                .iter()
+                .map(|track| scope.spawn(move || waveform_peaks_from_slices(track, 2, 48_000)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        })
+    });
+    println!(
+        "{label}: old sequential {old_seq:8.2} ms | new sequential {new_seq:8.2} ms ({:.2}x) | new 4 threads {new_par:8.2} ms ({:.2}x)",
+        old_seq / new_seq,
+        old_seq / new_par
+    );
+}
+
+fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "both".into());
+    let runs = 7;
+    let pool = fill_pool();
     println!("runs={runs} slice={SLICE} samples (BLOCK_FRAMES*2ch) pool={POOL} slices");
     for minutes in [10, 60, 120] {
-        let slices = track(minutes, 0);
+        let slices = track_slices(&pool, minutes, 0);
         let (old_ms, old) = if mode != "new" {
             let (t, o) = time(runs, || {
                 waveform_peaks(slices.iter().flat_map(|s| s.iter()), 2)
@@ -78,34 +117,14 @@ fn main() {
             new.len()
         );
     }
-    let tracks: Vec<Vec<&[f32]>> = (0..4).map(|t| track(60, t * 37)).collect();
-    let (old_seq, _) = time(runs, || {
-        tracks
-            .iter()
-            .map(|t| waveform_peaks(t.iter().flat_map(|s| s.iter()), 2))
-            .collect::<Vec<_>>()
-    });
-    let (new_seq, _) = time(runs, || {
-        tracks
-            .iter()
-            .map(|t| waveform_peaks_from_slices(t, 2, 48_000))
-            .collect::<Vec<_>>()
-    });
-    let (new_par, _) = time(runs, || {
-        std::thread::scope(|s| {
-            let handles: Vec<_> = tracks
-                .iter()
-                .map(|t| s.spawn(move || waveform_peaks_from_slices(t, 2, 48_000)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .collect::<Vec<_>>()
-        })
-    });
-    println!(
-        "4x60 min tracks: old sequential {old_seq:8.2} ms | new sequential {new_seq:8.2} ms ({:.2}x) | new 4 threads {new_par:8.2} ms ({:.2}x)",
-        old_seq / new_seq,
-        old_seq / new_par
-    );
+    let shared_tracks: Vec<Vec<&[f32]>> = (0..4).map(|t| track_slices(&pool, 60, t * 37)).collect();
+    bench_four_tracks("4x60 min tracks, shared buffer", &shared_tracks, runs);
+
+    let separate_pools: Vec<Vec<Vec<f32>>> = (0..4).map(|_| fill_pool()).collect();
+    let separate_tracks: Vec<Vec<&[f32]>> = separate_pools
+        .iter()
+        .enumerate()
+        .map(|(t, track_pool)| track_slices(track_pool, 60, t * 37))
+        .collect();
+    bench_four_tracks("4x60 min tracks, separate buffers", &separate_tracks, runs);
 }
